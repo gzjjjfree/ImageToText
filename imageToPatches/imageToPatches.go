@@ -29,7 +29,11 @@ const (
 	//vocabSize = 18385	// PP-OCRv5 的字典大小，已提取为全局变量
 
 	detInputSize = 640 // PP-OCRv3 默认是 640x640
-	recHeight    = 48  // PP-OCRv5 识别输入高度固定为 48，宽度根据实际图像动态调整
+	recTargetH = 48   // 模型要求的固定输入高度 (必须是 48)
+    //recVisualH = 38   // 建议：文字在 48px 中占据的视觉高度，留下上下各 5px 留白
+	recMaxW    = 960 // 设定一个合理的最大宽度，超过此宽度的长文本后续可以按比例截断或压缩
+	//leftPadding = 10   // 左侧留白，防止第一个字符太贴边
+
 	// V5 的下采样倍数。输入 48xW -> 输出 (W/4) 序列
 	v5DownsampleRatio = 8
 

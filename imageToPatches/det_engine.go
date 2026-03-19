@@ -86,12 +86,28 @@ func (d *DetEngine) Destroy() {
 	d.Session.Destroy()
 }
 
-// 复用检测时的 visited 数组，减少内存分配
-var visitedPool = sync.Pool{
-	New: func() any {
-		return make([]bool, detInputSize*detInputSize)
-	},
-}
+var (
+	// 复用检测时的 visited 数组，减少内存分配
+	visitedPool = sync.Pool{
+		New: func() any {
+			return make([]bool, detInputSize*detInputSize)
+		},
+	}
+
+	// 用于缩放的原图缓存区
+	resizeImgPool = sync.Pool{
+		New: func() interface{} {
+			return image.NewRGBA(image.Rect(0, 0, 640, 640))
+		},
+	}
+
+	// 专门为 BFS 准备的零分配队列 (640*640个像素，每个存 X 和 Y 两个坐标)
+	bfsQueuePool = sync.Pool{
+		New: func() interface{} {
+			return make([]int, 640*640*2)
+		},
+	}
+)
 
 // Detect 执行完整的检测流程
 func (d *DetEngine) Detect(srcImg image.Image) ([]TextLine, error) {
@@ -112,45 +128,6 @@ func (d *DetEngine) Detect(srcImg image.Image) ([]TextLine, error) {
 
 	// 4. 后续裁剪逻辑...
 	return boxesToLines(srcImg, boxes), nil
-}
-
-// fillPreprocessedData 将原图预处理并填充到 dest 切片中，同时返回缩放比例
-func fillPreprocessedData(srcImg image.Image, dest []float32) (ratioH, ratioW float64) {
-	// 增加防御性检查
-	if srcImg == nil {
-		return 0, 0
-	}
-	// 1. 获取原图尺寸
-	bounds := srcImg.Bounds()
-	origH, origW := bounds.Dy(), bounds.Dx()
-
-	// 2. 计算缩放比例
-	ratioH = float64(detInputSize) / float64(origH)
-	ratioW = float64(detInputSize) / float64(origW)
-
-	// 3. 缩放图片到 640x640
-	resized := image.NewRGBA(image.Rect(0, 0, detInputSize, detInputSize))
-	// 注意：draw.BiLinear.Scale 的参数顺序是 (dst, dstRect, src, srcRect, op, opts)
-	// 利用最近邻插值算法（BiLinear Interpolation）对图像进行缩放（Scaling）或拉伸（Resizing）。
-	// 它通过对输入图像中的像素进行加权平均来计算输出图像中每个像素的值，从而实现平滑的缩放效果。
-	draw.NearestNeighbor.Scale(resized, resized.Bounds(), srcImg, bounds, draw.Over, nil)
-
-	pix := resized.Pix // 获取底层字节切片 [R, G, B, A, R, G, B, A...]
-	size := 640 * 640
-	gOff := size     // Green 存储偏移
-	bOff := size * 2 // Blue 存储偏移
-
-	for i := 0; i < size; i++ {
-		// 每个像素占 4 字节 (RGBA)
-		p := i * 4
-
-		// (val / 255.0 - 0.5) / 0.5 简化后就是 (val / 127.5) - 1.0
-		dest[i] = float32(pix[p])/127.5 - 1.0        // R
-		dest[i+gOff] = float32(pix[p+1])/127.5 - 1.0 // G
-		dest[i+bOff] = float32(pix[p+2])/127.5 - 1.0 // B
-	}
-
-	return ratioH, ratioW
 }
 
 // boxesToLines 根据矩形框列表从原图裁剪出对应的行图片，并返回 TextLine 列表
@@ -192,40 +169,45 @@ func boxesToLines(srcImg image.Image, boxes []image.Rectangle) []TextLine {
 	return lines
 }
 
-// dbPostProcess 对概率图进行后处理，返回原图坐标的矩形框列表
+
+
+// GetBoxes 只做推理并返回坐标框，不裁图
+func (d *DetEngine) GetBoxes(srcImg image.Image) ([]image.Rectangle, error) {
+	inputSlice := d.InputTensor.(*ort.Tensor[float32]).GetData()
+	ratioH, ratioW := fillPreprocessedData(srcImg, inputSlice)
+
+	err := d.Session.Run()
+	if err != nil {
+		return nil, fmt.Errorf("Det 推理失败: %v", err)
+	}
+
+	return dbPostProcess(d.OutputData, ratioH, ratioW, srcImg.Bounds()), nil
+}
+
+// dbPostProcess 使用优化后的 BFS
 func dbPostProcess(probMap []float32, ratioH, ratioW float64, origBounds image.Rectangle) []image.Rectangle {
 	const threshold = 0.3
 	const minArea = 16
 
-	// 1. 创建二值图标记矩阵
-	//visited := make([]bool, 640*640)
 	visited := visitedPool.Get().([]bool)
-
-	// 重置数组
+	queue := bfsQueuePool.Get().([]int) // 获取预分配队列
 	for i := range visited {
 		visited[i] = false
 	}
 	defer visitedPool.Put(visited)
+	defer bfsQueuePool.Put(queue) // 归还队列
 
 	var boxes []image.Rectangle
+	paddingH, paddingW := 6, 6
 
-	// 在映射坐标时，给上下左右增加更合理的 padding
-	paddingH := 8  // 纵向多给一点，防止切掉笔锋
-	paddingW := 14 // 横向多给一点
-
-	// 2. 遍历概率图，寻找未访问的“高概率”像素点
 	for y := 0; y < 640; y++ {
 		for x := 0; x < 640; x++ {
 			if !visited[y*640+x] && probMap[y*640+x] > threshold {
-				// 3. 发现新文字块，使用 BFS (广度优先搜索) 找完整轮廓
-				minX, minY, maxX, maxY, area := bfs(probMap, visited, x, y, threshold)
+				// 传入复用的 queue
+				minX, minY, maxX, maxY, area := bfsOptimized(probMap, visited, x, y, threshold, queue)
 
-				// 4. 过滤噪点
-				if area < minArea {
-					continue
-				}
+				if area < minArea { continue }
 
-				// 5. 映射回原图坐标
 				rect := image.Rect(
 					int(math.Max(0, float64(minX)/ratioW-float64(paddingW))),
 					int(math.Max(0, float64(minY)/ratioH-float64(paddingH))),
@@ -236,46 +218,50 @@ func dbPostProcess(probMap []float32, ratioH, ratioW float64, origBounds image.R
 			}
 		}
 	}
-
 	return boxes
 }
 
-// 简单的 BFS 寻找连通区域
-func bfs(probMap []float32, visited []bool, startX, startY int, threshold float32) (int, int, int, int, int) {
+// 零分配的高性能 BFS
+func bfsOptimized(probMap []float32, visited []bool, startX, startY int, threshold float32, queue []int) (int, int, int, int, int) {
 	minX, maxX := startX, startX
 	minY, maxY := startY, startY
 	area := 0
 
-	queue := [][2]int{{startX, startY}}
+	// 模拟队列的头尾指针
+	head, tail := 0, 0
+	
+	// 入队 (x, y)
+	queue[tail] = startX; tail++
+	queue[tail] = startY; tail++
 	visited[startY*640+startX] = true
 
-	for len(queue) > 0 {
-		curr := queue[0]
-		queue = queue[1:]
-		x, y := curr[0], curr[1]
+	// 提前定义方向，避免在循环内部申请内存
+	dx := [4]int{0, 0, 1, -1}
+	dy := [4]int{1, -1, 0, 0}
+
+	for head < tail {
+		// 出队
+		x := queue[head]; head++
+		y := queue[head]; head++
 		area++
 
-		if x < minX {
-			minX = x
-		}
-		if x > maxX {
-			maxX = x
-		}
-		if y < minY {
-			minY = y
-		}
-		if y > maxY {
-			maxY = y
-		}
+		// 更新边界
+		if x < minX { minX = x }
+		if x > maxX { maxX = x }
+		if y < minY { minY = y }
+		if y > maxY { maxY = y }
 
-		// 检查上下左右 4 个邻居
-		dirs := [][2]int{{0, 1}, {0, -1}, {1, 0}, {-1, 0}}
-		for _, d := range dirs {
-			nx, ny := x+d[0], y+d[1]
-			if nx >= 0 && nx < 640 && ny >= 0 && ny < 640 && !visited[ny*640+nx] {
-				if probMap[ny*640+nx] > threshold {
-					visited[ny*640+nx] = true
-					queue = append(queue, [2]int{nx, ny})
+		// 检查 4 个邻居
+		for i := 0; i < 4; i++ {
+			nx, ny := x+dx[i], y+dy[i]
+			// 边界与访问检查
+			if nx >= 0 && nx < 640 && ny >= 0 && ny < 640 {
+				idx := ny*640 + nx
+				if !visited[idx] && probMap[idx] > threshold {
+					visited[idx] = true
+					// 入队
+					queue[tail] = nx; tail++
+					queue[tail] = ny; tail++
 				}
 			}
 		}
@@ -284,26 +270,56 @@ func bfs(probMap []float32, visited []bool, startX, startY int, threshold float3
 }
 
 func (d *DetEngine) DetectAndFixOrientation(src image.Image) ([]TextLine, error) {
-    lines, err := d.Detect(src) // 初次检测
-	if err != nil {
-		fmt.Printf("检测失败: %v\n", err)
-		return nil, err
+	// 1. 只获取框，不切图
+	boxes, err := d.GetBoxes(src) 
+	if err != nil { return nil, err }
+	
+	tallCount := 0
+	for _, box := range boxes {
+		if box.Dy() > box.Dx() {
+			tallCount++
+		}
 	}
-    
-    tallCount := 0
-    for _, line := range lines {
-        bounds := line.Image.Bounds()
-        if bounds.Dy() > bounds.Dx() { // 高度大于宽度
-            tallCount++
-        }
-    }
 
-    // 如果超过 50% 的框是竖着的，说明整张大图需要预旋转 90 度
-    if len(lines) > 0 && float32(tallCount)/float32(len(lines)) > 0.5 {
-        fmt.Println("检测到整图旋转，正在进行 90 度预修正...")
-        fixedImg := rotate90(src) // 实现一个 rotate90
-        return d.Detect(fixedImg) // 重新检测转正后的图
-    }
-    
-    return lines, nil
+	// 2. 判断方向
+	if len(boxes) > 0 && float32(tallCount)/float32(len(boxes)) > 0.5 {
+		fmt.Println("检测到整图旋转，进行 90 度修正...")
+		fixedImg := rotate90(src) 
+		// 重新获取转正后的框
+		boxes, err = d.GetBoxes(fixedImg) 
+		if err != nil { return nil, err }
+		// 3. 对修正后的图进行切分
+		return boxesToLines(fixedImg, boxes), nil
+	}
+	
+	// 3. 正常切分
+	return boxesToLines(src, boxes), nil
+}
+
+// 修改 fillPreprocessedData 以复用图像内存
+func fillPreprocessedData(srcImg image.Image, dest []float32) (ratioH, ratioW float64) {
+	if srcImg == nil { return 0, 0 }
+	bounds := srcImg.Bounds()
+	
+	ratioH = 640.0 / float64(bounds.Dy())
+	ratioW = 640.0 / float64(bounds.Dx())
+
+	// 复用内存
+	resized := resizeImgPool.Get().(*image.RGBA)
+	defer resizeImgPool.Put(resized)
+
+	draw.NearestNeighbor.Scale(resized, resized.Bounds(), srcImg, bounds, draw.Over, nil)
+
+	pix := resized.Pix 
+	size := 640 * 640
+	gOff, bOff := size, size*2 
+
+	for i := 0; i < size; i++ {
+		p := i * 4
+		// 位运算比乘法快一点点，且不需要强制类型转换开销
+		dest[i] = float32(pix[p])/127.5 - 1.0
+		dest[i+gOff] = float32(pix[p+1])/127.5 - 1.0
+		dest[i+bOff] = float32(pix[p+2])/127.5 - 1.0
+	}
+	return ratioH, ratioW
 }

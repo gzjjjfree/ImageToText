@@ -3,6 +3,7 @@ package imageToPatches
 import (
 	"fmt"
 	"image"
+	"math"
 	"runtime"
 	"strings"
 	"sync"
@@ -78,15 +79,31 @@ func NewRecEngine() (*RecEngine, error) {
 	return &RecEngine{Session: s}, nil
 }
 
-// 识别结果的缓存池，避免频繁申请巨大的 float32 切片
-// 由于 OCR 宽度动态变化，我们池化一个“足够大”的缓冲区
-var logitsPool = sync.Pool{
-	New: func() any {
-		// 预分配一个支持最大宽度（假设 1024px）的缓冲区
-		// 1024/8 * 18385 = 4,706,560 个 float32
-		return make([]float32, defaultBufferSize)
-	},
-}
+
+var (
+	// 由于 OCR 宽度动态变化，我们池化一个“足够大”的缓冲区
+	logitsPool = sync.Pool{
+		New: func() any {
+			// 预分配一个支持最大宽度（假设 1024px）的缓冲区
+			// 1024/8 * 18385 = 4,706,560 个 float32
+			return make([]float32, defaultBufferSize)
+		},
+	}
+	// 用于 Rec 模型输入前，存放缩放后图像的池子
+	recImagePool = sync.Pool{
+		New: func() any {
+			return image.NewRGBA(image.Rect(0, 0, recMaxW, recTargetH))
+		},
+	}
+
+	// 用于 Rec 模型 ONNX 输入的 []float32 内存池
+	// 尺寸: 3 通道 * 48 高度 * 最大宽度
+	recFloatPool = sync.Pool{
+		New: func() any {
+			return make([]float32, 3*recTargetH*recMaxW)
+		},
+	}
+)
 
 // PrewarmLogitsPool 暴露给外部的预热接口
 // size: 预期的缓冲区大小（float32 数量）
@@ -123,7 +140,7 @@ func (r *RecEngine) Recognize(inputData []float32, width int) (string, error) {
 
 	// 2. 准备输入 Tensor
 	// 输入 Tensor 的形状是 [1, 3, 48, width]，其中 width 是根据实际输入图像动态计算的
-	inputShape := ort.NewShape(1, 3, recHeight, int64(width))
+	inputShape := ort.NewShape(1, 3, recTargetH, int64(width))
 	inputTensor, err := ort.NewTensor(inputShape, inputData)
 	if err != nil {
 		return "", err
@@ -185,151 +202,6 @@ func (r *RecEngine) Recognize(inputData []float32, width int) (string, error) {
 	// 6. 解码：只取模型真正输出的那部分数据
 	// 哪怕 logitsData 后面有预留的空白，也绝对不会干扰结果
 	return ctcDecode(logitsData[:actualN*vocabSize]), nil
-}
-
-// processParallel 并行处理多个文本行的识别
-func processParallel(textLines []TextLine) []RecognitionResult {
-	// 1. 获取全局识别引擎实例
-	engine, err := GetGlobalRecEngine()
-	if err != nil {
-		return nil
-	}
-	clsEngine, err := GetGlobalClsEngine() // 获取分类引擎
-	if err != nil {
-		return nil
-	}
-
-	results := make([]RecognitionResult, len(textLines))
-
-	// 1. 全局偏置标记
-    var globalFlip int32 = 0 // 0: 未知, 1: 确定转正, 2: 确定翻转 180
-    
-    // 2. 抽样预判（前 10 行）
-    sampleSize := 10
-    if len(textLines) < sampleSize { sampleSize = len(textLines) }
-    
-    flipVotes := 0
-    for i := 0; i < sampleSize; i++ {
-        if clsEngine.ShouldRotate180(textLines[i].Image) {
-            flipVotes++
-        }
-    }
-    
-    // 如果抽样中超过 80% 一致，则锁定全局状态
-    if float32(flipVotes)/float32(sampleSize) > 0.8 {
-        globalFlip = 2 // 全局翻转
-    } else if float32(flipVotes)/float32(sampleSize) < 0.2 {
-        globalFlip = 1 // 全局不翻转
-    }
-
-	var wg sync.WaitGroup
-
-	// 限制并发协程数
-	sem := make(chan struct{}, runtime.NumCPU())
-
-	for i := range textLines {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			sem <- struct{}{}        // 获取令牌
-			defer func() { <-sem }() // 释放令牌
-
-			//statusTime := time.Now()
-
-			img := textLines[idx].Image
-
-			// 使用投票结果，避免重复推理
-            if globalFlip == 2 {
-                img = rotate180(img)
-            } else if globalFlip == 0 {
-                // 只有在无法确定全局状态时，才进行单行推理（兜底）
-                if clsEngine.ShouldRotate180(img) {
-                    img = rotate180(img)
-                }
-            }
-
-			//if clsEngine.ShouldRotate180(img) {
-			//	img = rotate180(img) // 如果倒了，转正它
-			//}
-
-			// 将子图转为 float32 [1, 3, 48, W]
-			inputData, actualWidth := preprocessSingleLine(img)
-
-			// 调用识别
-			text, err := engine.Recognize(inputData, actualWidth)
-			if err != nil {
-				results[idx] = RecognitionResult{Text: "识别失败"}
-				return
-			}
-
-			//statusduration := time.Since(statusTime)
-			//timetext := " 识别耗时:" + fmt.Sprintf("%.3fs", statusduration.Seconds())
-
-			results[idx] = RecognitionResult{Text: text}
-		}(i)
-	}
-
-	wg.Wait()
-	return results
-}
-
-// 专门为单行识别设计的预处理
-func preprocessSingleLine(src image.Image) ([]float32, int) {
-	const targetH = 48
-	const maxW = 1280
-
-	// 1. 计算缩放后的宽度，保持纵横比
-	bounds := src.Bounds()
-	ratio := float64(targetH) / float64(bounds.Dy())
-	newW := int(float64(bounds.Dx()) * ratio)
-	if newW > maxW {
-		newW = maxW
-	}
-
-	// 2. 创建一个宽度对齐到 8 的 RGBA 图像，缩放并填充背景为白色
-	alignedW := (newW + 7) &^ 7
-	if alignedW < 32 {
-		alignedW = 32
-	}
-
-	dst := image.NewRGBA(image.Rect(0, 0, alignedW, targetH))
-	for i := range dst.Pix {
-		dst.Pix[i] = 255
-	}
-	// 使用 BiLinear 进行缩放，比 NearestNeighbor 产生的边缘更平滑，有利于识别
-	draw.BiLinear.Scale(dst, image.Rect(0, 0, newW, targetH), src, bounds, draw.Over, nil)
-
-	// --- 适配 V5 的归一化处理 ---
-	stride := dst.Stride
-	pix := dst.Pix
-	data := make([]float32, 3*targetH*alignedW)
-
-	for y := 0; y < targetH; y++ {
-		for x := 0; x < alignedW; x++ {
-			baseIdx := y*stride + x*4
-
-			// 直接获取 R, G, B
-			r := float32(pix[baseIdx])
-			g := float32(pix[baseIdx+1])
-			b := float32(pix[baseIdx+2])
-
-			// 方案 A：转灰度（最稳，适合大多数场景）
-			gray := 0.299*r + 0.587*g + 0.114*b
-
-			// V5 标准归一化公式：(val / 255.0 - 0.5) / 0.5  => val / 127.5 - 1.0
-			val := gray/127.5 - 1.0
-
-			// 写入 3 个通道 (CHW 格式)
-			// 第一通道 (R)
-			data[y*alignedW+x] = val
-			// 第二通道 (G)
-			data[y*alignedW+x+targetH*alignedW] = val
-			// 第三通道 (B)
-			data[y*alignedW+x+2*targetH*alignedW] = val
-		}
-	}
-
-	return data, alignedW
 }
 
 // ctcDecode 实现 CTC 解码逻辑，输入是 [N, vocabSize] 的概率矩阵
@@ -406,4 +278,155 @@ func ctcDecode(logits []float32) string {
 	}
 
 	return sb.String()
+}
+
+// preprocessRec 接收 SubImage 切图，并将其处理填入从池中借出的 destFloat 中
+// 返回值 actualW 是缩放后的实际宽度，用于构建动态 Tensor
+func preprocessRec(subImg image.Image, destFloat []float32) (actualW int) {
+	bounds := subImg.Bounds()
+	origW, origH := bounds.Dx(), bounds.Dy()
+
+	// 1. 基于 48px 的目标高度计算宽度，保持原始纵横比
+	tmpW := int(math.Round(float64(origW) * float64(recTargetH) / float64(origH)))
+
+	// 计算总宽度：左边距 + 图像宽 + 右侧缓冲，并进行 8 像素对齐
+	drawW := tmpW
+    if tmpW > recMaxW {
+        // 如果超过最大限制，强制压缩到 recMaxW，防止截断
+        drawW = recMaxW
+        actualW = recMaxW
+    } else {
+        // 没超过限制，按 8 像素对齐（PP-OCR 习惯）
+        actualW = (tmpW + 7) &^ 7
+        if actualW < 32 { actualW = 32 }
+    }
+
+	// 2. 从池中借用一块大画布用于存放缩放结果
+	tempImg := recImagePool.Get().(*image.RGBA)
+	defer recImagePool.Put(tempImg)
+
+	// 只使用大画布中实际需要的那部分区域
+	fullRect := image.Rect(0, 0, actualW, recTargetH)
+	draw.Draw(tempImg, fullRect, image.White, image.Point{}, draw.Src)
+
+	// --- 3. 执行缩放 ---
+    // targetRect 的宽度是 drawW。
+	// 注意：这里需要先清空这一小块区域的背景（通常 OCR 模型习惯白底）
+	// 因为 tempImg 是复用的，里面可能有上次的脏数据
+	// 如果 drawW == recMaxW，说明发生了压缩，长句子会变瘦但会被完整保留。
+    targetRect := image.Rect(0, 0, drawW, recTargetH)
+	// 3. 执行缩放（注意：这里缩放到 tmpW，即保持原比例，右边留出对齐用的空白）
+    draw.BiLinear.Scale(tempImg, targetRect, subImg, bounds, draw.Over, nil)
+
+	// 4. 将像素转为 []float32 并填入 destFloat
+	pix := tempImg.Pix
+	stride := tempImg.Stride
+	channelSize := recTargetH * actualW
+
+	for y := 0; y < recTargetH; y++ {
+		rowOffset := y * stride
+		for x := 0; x < actualW; x++ {
+			p := rowOffset + x*4
+
+			// 归一化公式: (val / 127.5) - 1.0
+			r := float32(pix[p])/127.5 - 1.0
+			g := float32(pix[p+1])/127.5 - 1.0
+			b := float32(pix[p+2])/127.5 - 1.0
+			 //CHW 格式排列
+			destFloat[y*actualW+x] = r
+			destFloat[channelSize+y*actualW+x] = g
+			destFloat[channelSize*2+y*actualW+x] = b
+		}
+	}
+
+	return actualW
+}
+
+func processParallel(textLines []TextLine) []RecognitionResult {
+	engine, err := GetGlobalRecEngine()
+	if err != nil {
+		return nil
+	}
+	// ... 获取 clsEngine 和前期投票判别逻辑不变 ...
+
+	results := make([]RecognitionResult, len(textLines))
+
+	clsEngine, err := GetGlobalClsEngine() // 获取分类引擎
+	if err != nil {
+		return nil
+	}
+
+	// 1. 全局偏置标记
+	var globalFlip int32 = 0 // 0: 未知, 1: 确定转正, 2: 确定翻转 180
+
+	// 2. 抽样预判（前 10 行）
+	sampleSize := 10
+	if len(textLines) < sampleSize {
+		sampleSize = len(textLines)
+	}
+
+	flipVotes := 0
+	for i := 0; i < sampleSize; i++ {
+		if clsEngine.ShouldRotate180(textLines[i].Image) {
+			flipVotes++
+		}
+	}
+
+	// 如果抽样中超过 80% 一致，则锁定全局状态
+	if float32(flipVotes)/float32(sampleSize) > 0.8 {
+		globalFlip = 2 // 全局翻转
+	} else if float32(flipVotes)/float32(sampleSize) < 0.2 {
+		globalFlip = 1 // 全局不翻转
+	}
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.NumCPU())
+
+	for i := range textLines {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			img := textLines[idx].Image // 这就是那个几乎无开销的 SubImage
+
+			// 根据方向投票结果决定是否旋转...
+			// if globalFlip == 2 { img = rotate180(img) }
+			// 使用投票结果，避免重复推理
+			if globalFlip == 2 {
+				img = rotate180(img)
+			} else if globalFlip == 0 {
+				// 只有在无法确定全局状态时，才进行单行推理（兜底）
+				if clsEngine.ShouldRotate180(img) {
+					img = rotate180(img)
+				}
+			}
+
+			// 1. 核心：从池中获取复用的 float32 切片
+			tensorData := recFloatPool.Get().([]float32)
+			// 注意：必须在整个过程（包括推理）结束后再归还
+			defer recFloatPool.Put(tensorData)
+
+			// 2. 预处理，只使用 tensorData 的前 [3 * 48 * actualWidth] 部分
+			actualWidth := preprocessRec(img, tensorData)
+
+			// 3. 截取实际有效的数据长度传给 Rec 引擎
+			// 因为 ONNX Runtime 需要严格匹配 Tensor 的尺寸
+			validDataSize := 3 * recTargetH * actualWidth
+			validData := tensorData[:validDataSize]
+
+			// 4. 调用识别引擎 (你现有的 RecEngine 需要能接收 validData 和 actualWidth)
+			text, err := engine.Recognize(validData, actualWidth)
+			if err != nil {
+				results[idx] = RecognitionResult{Text: "识别失败"}
+				return
+			}
+
+			results[idx] = RecognitionResult{Text: text}
+		}(i)
+	}
+
+	wg.Wait()
+	return results
 }
