@@ -1,0 +1,164 @@
+name: Cross Platform Release
+
+on:
+  push:
+    tags:
+      - "v*" # 当推送 v1.0.0 等标签时触发
+  workflow_dispatch: #
+
+# 在这里添加全局环境变量
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+
+      - name: Set up Java
+        # 签名工具 apksigner 需要 Java 环境
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Install Fyne CLI
+        # 使用你本地成功的 fyne 命令工具
+        run: go install fyne.io/tools/cmd/fyne@latest
+
+      - name: Build Android (Native Mode)
+        env:
+          K_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          K_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          K_ALIAS: "imagetotext-alias"
+        run: |
+          RAW_VERSION=${GITHUB_REF#refs/tags/}
+          # 2. 下载并安装 bundletool (解决报错核心)
+          # 2. 手动下载 bundletool (Google 官方)
+          BT_VERSION="1.17.0"
+          curl -L -o bundletool.jar https://github.com/google/bundletool/releases/download/${BT_VERSION}/bundletool-all-${BT_VERSION}.jar
+
+          # 3. 创建一个命令脚本，让 fyne 能够通过 "bundletool" 这个名字调用它
+          # 使用 printf 确保换行和内容准确，添加 #!/bin/bash
+          printf "#!/bin/bash\njava -jar $(pwd)/bundletool.jar \"\$@\"" > bundletool
+          chmod +x bundletool
+          export PATH=$PATH:$(pwd)
+
+          # 验证 bundletool 是否可用
+          ./bundletool version
+
+          # 1. 还原 Keystore # 上传服务器前命令 base64 -w 0 upload-keystore.jks
+          echo "$K_BASE64" | base64 -d > release.keystore
+
+          # 如果 RAW_VERSION 看起来不像版本号（比如是 main 或 master), 则设为 0.0.1
+          if [[ $RAW_VERSION =~ ^v?[0-9] ]]; then
+            CLEAN_VERSION=$(echo $RAW_VERSION | sed 's/^v//')
+          else
+            CLEAN_VERSION="0.0.1"
+          fi
+          # 4. 获取 Build ID (appBuild)
+          # 使用 GitHub 的运行次数作为版本代码，确保它是递增的正整数
+          BUILD_ID=${{ github.run_number }}
+
+          echo "Final App Version: $CLEAN_VERSION"
+          echo "Final Build ID: $BUILD_ID"
+
+          # 3. 设置 Android 环境变量
+          export ANDROID_HOME=$ANDROID_SDK_ROOT
+          export ANDROID_NDK_HOME=$(ls -d $ANDROID_SDK_ROOT/ndk/* | tail -1)
+
+          # 4. 使用 release 命令进行正式打包
+          # 注意：这里改成了 release, 并且参数名在 release 下是有效的
+          fyne release -os android/arm64 \
+            --app-id com.gzjjj.imagetotext \
+            --icon Icon.png \
+            --keystore release.keystore \
+            --keystore-pass "$K_PASS" \
+            --key-pass "$K_PASS" \
+            --app-version "$CLEAN_VERSION" \
+            --app-build "$BUILD_ID" \
+            --key-name "$K_ALIAS" \
+            --name imagetotext
+            
+          # 使用 bundletool 生成包含通用 APK 的 apks 压缩包
+          ./bundletool build-apks \
+            --bundle=imagetotext.aab \
+            --output=imagetotext.apks \
+            --mode=universal \
+            --ks=release.keystore \
+            --ks-pass=pass:"$K_PASS" \
+            --ks-key-alias="$K_ALIAS" \
+            --key-pass=pass:"$K_PASS"
+
+          # 从 .apks 中提取出真正的 .apk 文件
+          unzip -p imagetotext.apks universal.apk >imagetotext_Native.apk
+
+          echo "Success! imagetotext.apk has been generated."
+
+          # 将库文件强行注入已经生成的 apk
+          cp imagetotext_Native.apk imagetotext_x86_Native.apk
+          zip -u imagetotext_x86_Native.apk lib/x86_64/libonnxruntime.so        
+          zip -u imagetotext_Native.apk lib/arm64-v8a/libonnxruntime.so
+
+          # 自动寻找最新的 build-tools 路径
+          BUILD_TOOLS_PATH=$(ls -d $ANDROID_HOME/build-tools/* | tail -1)
+          ZIPALIGN="$BUILD_TOOLS_PATH/zipalign"
+          APKSIGNER="$BUILD_TOOLS_PATH/apksigner"
+
+          # 对齐 (zipalign) - 这一步对 Android 性能和稳定性很重要
+          $ZIPALIGN -f -v 4 imagetotext_x86_Native.apk imagetotext_x86_Native-aligned.apk
+          $ZIPALIGN -f -v 4 imagetotext_Native.apk imagetotext_Native-aligned.apk          
+
+          echo "Using build-tools from: $BUILD_TOOLS_PATH"
+
+          # 重新签名（因为修改了 APK 内容，必须重签才能运行）
+          $APKSIGNER sign --ks release.keystore \
+            --ks-pass pass:"$K_PASS" \
+            --ks-key-alias "imagetotext-alias" \
+            --key-pass pass:"$K_PASS" \
+            --out imagetotext_x86_Native-final.apk \
+            imagetotext_x86_Native-aligned.apk
+
+          $APKSIGNER sign --ks release.keystore \
+            --ks-pass pass:"$K_PASS" \
+            --ks-key-alias "imagetotext-alias" \
+            --key-pass pass:"$K_PASS" \
+            --out imagetotext_Native-final.apk \
+            imagetotext_Native-aligned.apk
+
+          echo "Success! Native artifacts renamed."
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-apk
+          path: |
+            imagetotext_Native-final.apk
+            imagetotext_x86_Native-final.apk
+          compression-level: 0
+
+  create-release:
+    needs: [build-android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: android-apk
+          path: ./release_assets      
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

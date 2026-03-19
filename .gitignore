@@ -1,0 +1,11 @@
+*.sh
+*.apk
+*.apks
+*.aab
+*.apk.idsig
+*.jpg
+*.jks
+*.keystore
+ch_PP-OCRv5_rec_server_infer.onnx
+ch_PP-OCRv5_server_det.onnx
+onnx_extracted/
