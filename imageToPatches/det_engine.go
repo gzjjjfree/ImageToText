@@ -110,25 +110,25 @@ var (
 )
 
 // Detect 执行完整的检测流程
-func (d *DetEngine) Detect(srcImg image.Image) ([]TextLine, error) {
-	// 1. 预处理：将图片数据填入已经绑定好的 inputData
-	// 注意：这里需要直接修改 d.inputTensor 关联的底层数据
-	// 或者简单点，获取 Tensor 的 Slice 并填充
-	inputSlice := d.InputTensor.(*ort.Tensor[float32]).GetData()
-	ratioH, ratioW := fillPreprocessedData(srcImg, inputSlice)
-
-	// 2. 执行推理：此时 Run() 不带任何参数
-	err := d.Session.Run()
-	if err != nil {
-		return nil, fmt.Errorf("Det 推理失败: %v", err)
-	}
-
-	// 3. 直接使用 d.outputData 进行后处理，得到原图坐标的矩形框列表
-	boxes := dbPostProcess(d.OutputData, ratioH, ratioW, srcImg.Bounds())
-
-	// 4. 后续裁剪逻辑...
-	return boxesToLines(srcImg, boxes), nil
-}
+//func (d *DetEngine) Detect(srcImg image.Image) ([]TextLine, error) {
+//	// 1. 预处理：将图片数据填入已经绑定好的 inputData
+//	// 注意：这里需要直接修改 d.inputTensor 关联的底层数据
+//	// 或者简单点，获取 Tensor 的 Slice 并填充
+//	inputSlice := d.InputTensor.(*ort.Tensor[float32]).GetData()
+//	ratioH, ratioW := fillPreprocessedData(srcImg, inputSlice)
+//
+//	// 2. 执行推理：此时 Run() 不带任何参数
+//	err := d.Session.Run()
+//	if err != nil {
+//		return nil, fmt.Errorf("Det 推理失败: %v", err)
+//	}
+//
+//	// 3. 直接使用 d.outputData 进行后处理，得到原图坐标的矩形框列表
+//	boxes := dbPostProcess(d.OutputData, ratioH, ratioW, srcImg.Bounds())
+//
+//	// 4. 后续裁剪逻辑...
+//	return boxesToLines(srcImg, boxes), nil
+//}
 
 // boxesToLines 根据矩形框列表从原图裁剪出对应的行图片，并返回 TextLine 列表
 func boxesToLines(srcImg image.Image, boxes []image.Rectangle) []TextLine {
@@ -187,7 +187,7 @@ func (d *DetEngine) GetBoxes(srcImg image.Image) ([]image.Rectangle, error) {
 // dbPostProcess 使用优化后的 BFS
 func dbPostProcess(probMap []float32, ratioH, ratioW float64, origBounds image.Rectangle) []image.Rectangle {
 	const threshold = 0.3
-	const minArea = 16
+	const minArea = 5
 
 	visited := visitedPool.Get().([]bool)
 	queue := bfsQueuePool.Get().([]int) // 获取预分配队列
@@ -206,6 +206,7 @@ func dbPostProcess(probMap []float32, ratioH, ratioW float64, origBounds image.R
 				// 传入复用的 queue
 				minX, minY, maxX, maxY, area := bfsOptimized(probMap, visited, x, y, threshold, queue)
 
+				// 过滤掉过小的区域
 				if area < minArea { continue }
 
 				rect := image.Rect(
@@ -308,7 +309,7 @@ func fillPreprocessedData(srcImg image.Image, dest []float32) (ratioH, ratioW fl
 	resized := resizeImgPool.Get().(*image.RGBA)
 	defer resizeImgPool.Put(resized)
 
-	draw.NearestNeighbor.Scale(resized, resized.Bounds(), srcImg, bounds, draw.Over, nil)
+	draw.BiLinear.Scale(resized, resized.Bounds(), srcImg, bounds, draw.Over, nil)
 
 	pix := resized.Pix 
 	size := 640 * 640

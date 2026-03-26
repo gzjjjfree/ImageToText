@@ -5,6 +5,7 @@ import (
 	"image"
 	"math"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
@@ -78,7 +79,6 @@ func NewRecEngine() (*RecEngine, error) {
 
 	return &RecEngine{Session: s}, nil
 }
-
 
 var (
 	// 由于 OCR 宽度动态变化，我们池化一个“足够大”的缓冲区
@@ -291,15 +291,17 @@ func preprocessRec(subImg image.Image, destFloat []float32) (actualW int) {
 
 	// 计算总宽度：左边距 + 图像宽 + 右侧缓冲，并进行 8 像素对齐
 	drawW := tmpW
-    if tmpW > recMaxW {
-        // 如果超过最大限制，强制压缩到 recMaxW，防止截断
-        drawW = recMaxW
-        actualW = recMaxW
-    } else {
-        // 没超过限制，按 8 像素对齐（PP-OCR 习惯）
-        actualW = (tmpW + 7) &^ 7
-        if actualW < 32 { actualW = 32 }
-    }
+	if tmpW > recMaxW {
+		// 如果超过最大限制，强制压缩到 recMaxW，防止截断
+		drawW = recMaxW
+		actualW = recMaxW
+	} else {
+		// 没超过限制，按 8 像素对齐（PP-OCR 习惯）
+		actualW = (tmpW + 7) &^ 7
+		if actualW < 32 {
+			actualW = 32
+		}
+	}
 
 	// 2. 从池中借用一块大画布用于存放缩放结果
 	tempImg := recImagePool.Get().(*image.RGBA)
@@ -310,32 +312,56 @@ func preprocessRec(subImg image.Image, destFloat []float32) (actualW int) {
 	draw.Draw(tempImg, fullRect, image.White, image.Point{}, draw.Src)
 
 	// --- 3. 执行缩放 ---
-    // targetRect 的宽度是 drawW。
+	// targetRect 的宽度是 drawW。
 	// 注意：这里需要先清空这一小块区域的背景（通常 OCR 模型习惯白底）
 	// 因为 tempImg 是复用的，里面可能有上次的脏数据
 	// 如果 drawW == recMaxW，说明发生了压缩，长句子会变瘦但会被完整保留。
-    targetRect := image.Rect(0, 0, drawW, recTargetH)
+	targetRect := image.Rect(0, 0, drawW, recTargetH)
 	// 3. 执行缩放（注意：这里缩放到 tmpW，即保持原比例，右边留出对齐用的空白）
-    draw.BiLinear.Scale(tempImg, targetRect, subImg, bounds, draw.Over, nil)
-
+	//draw.BiLinear.Scale(tempImg, targetRect, subImg, bounds, draw.Over, nil)
+	// 换用高质量缩放算法
+	draw.CatmullRom.Scale(tempImg, targetRect, subImg, bounds, draw.Over, nil)
+	// 4. 将像素转为 []float32 并填入 destFloat
+	//pix := tempImg.Pix
+	//stride := tempImg.Stride
+	//channelSize := recTargetH * actualW
+	//
+	//for y := 0; y < recTargetH; y++ {
+	//	rowOffset := y * stride
+	//	for x := 0; x < actualW; x++ {
+	//		p := rowOffset + x*4
+	//
+	//		// 归一化公式: (val / 127.5) - 1.0
+	//		r := float32(pix[p])/127.5 - 1.0
+	//		g := float32(pix[p+1])/127.5 - 1.0
+	//		b := float32(pix[p+2])/127.5 - 1.0
+	//		 //CHW 格式排列
+	//		destFloat[y*actualW+x] = r
+	//		destFloat[channelSize+y*actualW+x] = g
+	//		destFloat[channelSize*2+y*actualW+x] = b
+	//	}
+	//}
 	// 4. 将像素转为 []float32 并填入 destFloat
 	pix := tempImg.Pix
 	stride := tempImg.Stride
 	channelSize := recTargetH * actualW
+	c1 := channelSize
+	c2 := channelSize * 2
 
 	for y := 0; y < recTargetH; y++ {
 		rowOffset := y * stride
+		destRowOffset := y * actualW // 提前计算行偏移
 		for x := 0; x < actualW; x++ {
-			p := rowOffset + x*4
+			p := rowOffset + x<<2 // x*4 换成位移
 
-			// 归一化公式: (val / 127.5) - 1.0
-			r := float32(pix[p])/127.5 - 1.0
-			g := float32(pix[p+1])/127.5 - 1.0
-			b := float32(pix[p+2])/127.5 - 1.0
-			 //CHW 格式排列
-			destFloat[y*actualW+x] = r
-			destFloat[channelSize+y*actualW+x] = g
-			destFloat[channelSize*2+y*actualW+x] = b
+			// 直接计算索引，减少乘法
+			idx := destRowOffset + x
+
+			// 归一化公式优化：提取常数
+			const inv127 = 1.0 / 127.5
+			destFloat[idx] = float32(pix[p])*inv127 - 1.0
+			destFloat[idx+c1] = float32(pix[p+1])*inv127 - 1.0
+			destFloat[idx+c2] = float32(pix[p+2])*inv127 - 1.0
 		}
 	}
 
@@ -343,6 +369,7 @@ func preprocessRec(subImg image.Image, destFloat []float32) (actualW int) {
 }
 
 func processParallel(textLines []TextLine) []RecognitionResult {
+	//statusTime := time.Now()
 	engine, err := GetGlobalRecEngine()
 	if err != nil {
 		return nil
@@ -378,6 +405,90 @@ func processParallel(textLines []TextLine) []RecognitionResult {
 	} else if float32(flipVotes)/float32(sampleSize) < 0.2 {
 		globalFlip = 1 // 全局不翻转
 	}
+
+	// ==========================================
+	// ⭐ 核心优化：基于方向和行容差进行智能排序
+	// ==========================================
+
+	isUpsideDown := (globalFlip == 2)
+
+	// 2. 计算图像的水平中心点 (用于分栏)
+	// 假设 textLines 已经包含了检测框信息，我们取所有框的中间位置作为参考
+	imgCenterX := 0
+	if len(textLines) > 0 {
+		// 简单取所有框 X 范围的中点，或者直接传图片宽度进来
+		minX, maxX := textLines[0].Box.Min.X, textLines[0].Box.Max.X
+		for _, line := range textLines {
+			if line.Box.Min.X < minX {
+				minX = line.Box.Min.X
+			}
+			if line.Box.Max.X > maxX {
+				maxX = line.Box.Max.X
+			}
+		}
+		imgCenterX = (minX + maxX) / 2
+	}
+
+	// 3. 执行双栏智能排序
+	sort.Slice(textLines, func(i, j int) bool {
+		boxI := textLines[i].Box
+		boxJ := textLines[j].Box
+
+		centerI_X := boxI.Min.X + boxI.Dx()/2
+		centerJ_X := boxJ.Min.X + boxJ.Dx()/2
+
+		// --- 第一步：确定分栏逻辑 ---
+		// 如果图片是倒转的(isUpsideDown)，左栏(Column 1)在视觉右侧，右栏(Column 2)在视觉左侧
+		var colI, colJ int
+		if isUpsideDown {
+			if centerI_X > imgCenterX {
+				colI = 1
+			} else {
+				colI = 2
+			}
+			if centerJ_X > imgCenterX {
+				colJ = 1
+			} else {
+				colJ = 2
+			}
+		} else {
+			if centerI_X < imgCenterX {
+				colI = 1
+			} else {
+				colI = 2
+			}
+			if centerJ_X < imgCenterX {
+				colJ = 1
+			} else {
+				colJ = 2
+			}
+		}
+
+		// 如果不在同一栏，优先按栏排序
+		if colI != colJ {
+			return colI < colJ
+		}
+
+		// --- 第二步：在同一栏内进行行排序 (带容差) ---
+		centerY_I := boxI.Min.Y + boxI.Dy()/2
+		centerY_J := boxJ.Min.Y + boxJ.Dy()/2
+		avgHeight := (boxI.Dy() + boxJ.Dy()) / 2
+
+		// 同行判断
+		if absInt(centerY_I-centerY_J) < avgHeight/2 {
+			if isUpsideDown {
+				return boxI.Min.X > boxJ.Min.X // 倒转时，行内从右往左
+			}
+			return boxI.Min.X < boxJ.Min.X // 正常时，行内从左往右
+		}
+
+		// 跨行判断
+		if isUpsideDown {
+			return centerY_I > centerY_J // 倒转时，从下往上读
+		}
+		return centerY_I < centerY_J // 正常时，从上往下读
+	})
+	// ==========================================
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, runtime.NumCPU())
@@ -428,5 +539,15 @@ func processParallel(textLines []TextLine) []RecognitionResult {
 	}
 
 	wg.Wait()
+	//statusduration := time.Since(statusTime)
+	//fmt.Println("识别: %.3fs", statusduration.Seconds())
 	return results
+}
+
+// 辅助函数：求绝对值
+func absInt(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
 }
