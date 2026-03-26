@@ -57,12 +57,11 @@ jobs:
           # 1. 还原 Keystore # 上传服务器前命令 base64 -w 0 upload-keystore.jks
           echo "$K_BASE64" | base64 -d > release.keystore
 
-          # 如果 RAW_VERSION 看起来不像版本号（比如是 main 或 master), 则设为 0.0.1
-          if [[ $RAW_VERSION =~ ^v?[0-9] ]]; then
-            CLEAN_VERSION=$(echo $RAW_VERSION | sed 's/^v//')
-          else
-            CLEAN_VERSION="0.0.1"
-          fi
+          # 3. 版本号处理
+          RAW_VERSION=${GITHUB_REF#refs/tags/}
+          CLEAN_VERSION=$(echo $RAW_VERSION | sed 's/^v//')
+          [[ $CLEAN_VERSION =~ ^[0-9] ]] || CLEAN_VERSION="0.0.1"
+
           # 4. 获取 Build ID (appBuild)
           # 使用 GitHub 的运行次数作为版本代码，确保它是递增的正整数
           BUILD_ID=${{ github.run_number }}
@@ -86,6 +85,8 @@ jobs:
             --app-build "$BUILD_ID" \
             --key-name "$K_ALIAS" \
             --name imagetotext
+
+          echo "aab OK, now generating universal APK..."
             
           # 使用 bundletool 生成包含通用 APK 的 apks 压缩包
           ./bundletool build-apks \
@@ -97,15 +98,25 @@ jobs:
             --ks-key-alias="$K_ALIAS" \
             --key-pass=pass:"$K_PASS"
 
+          echo "apk OK, now extracting universal APK..."
+
           # 从 .apks 中提取出真正的 .apk 文件
           unzip -p imagetotext.apks universal.apk >imagetotext_Native.apk
 
           echo "Success! imagetotext.apk has been generated."
 
+          # 先在当前环境创建对应的目录结构，然后再 zip 注入
+          mkdir -p lib/arm64-v8a lib/x86_64
+
+          # 分别注入并准备不同架构的 APK
+          cp imagetotext_Native.apk imagetotext_arm64.apk
+          cp imagetotext_Native.apk imagetotext_x64.apk
+
           # 将库文件强行注入已经生成的 apk
-          cp imagetotext_Native.apk imagetotext_x86_Native.apk
-          zip -u imagetotext_x86_Native.apk lib/x86_64/libonnxruntime.so        
-          zip -u imagetotext_Native.apk lib/arm64-v8a/libonnxruntime.so
+          zip -u imagetotext_arm64.apk lib/arm64-v8a/libonnxruntime.so
+          zip -u imagetotext_x64.apk lib/x86_64/libonnxruntime.so
+
+          echo "Native libraries injected into APKs."
 
           # 自动寻找最新的 build-tools 路径
           BUILD_TOOLS_PATH=$(ls -d $ANDROID_HOME/build-tools/* | tail -1)
@@ -140,8 +151,8 @@ jobs:
         with:
           name: android-apk
           path: |
-            imagetotext_Native-final.apk
-            imagetotext_x86_Native-final.apk
+            imagetotext_arm64.apk
+            imagetotext_x64.apk
           compression-level: 0
 
   create-release:
