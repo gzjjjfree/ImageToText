@@ -71,9 +71,7 @@ jobs:
 
           # 3. 设置 Android 环境变量
           export ANDROID_HOME=$ANDROID_SDK_ROOT
-          export ANDROID_NDK_HOME=$(ls -d $ANDROID_SDK_ROOT/ndk/* | tail -1)
-
-          echo "K_PASS: $K_PASS"
+          export ANDROID_NDK_HOME=$(ls -d $ANDROID_SDK_ROOT/ndk/* | tail -1)          
 
           # 4. 使用 release 命令进行正式打包
           # 注意：这里改成了 release, 并且参数名在 release 下是有效的
