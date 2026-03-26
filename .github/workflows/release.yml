@@ -73,6 +73,8 @@ jobs:
           export ANDROID_HOME=$ANDROID_SDK_ROOT
           export ANDROID_NDK_HOME=$(ls -d $ANDROID_SDK_ROOT/ndk/* | tail -1)
 
+          echo "K_PASS: $K_PASS"
+
           # 4. 使用 release 命令进行正式打包
           # 注意：这里改成了 release, 并且参数名在 release 下是有效的
           fyne release -os android/arm64 \
@@ -109,12 +111,12 @@ jobs:
           mkdir -p lib/arm64-v8a lib/x86_64
 
           # 分别注入并准备不同架构的 APK
-          cp imagetotext_Native.apk imagetotext_arm64.apk
-          cp imagetotext_Native.apk imagetotext_x64.apk
+          cp imagetotext_Native.apk imagetotext_arm64_raw.apk
+          cp imagetotext_Native.apk imagetotext_x64_raw.apk
 
           # 将库文件强行注入已经生成的 apk
-          zip -u imagetotext_arm64.apk lib/arm64-v8a/libonnxruntime.so
-          zip -u imagetotext_x64.apk lib/x86_64/libonnxruntime.so
+          zip -u imagetotext_arm64_raw.apk lib/arm64-v8a/libonnxruntime.so
+          zip -u imagetotext_x64_raw.apk lib/x86_64/libonnxruntime.so
 
           echo "Native libraries injected into APKs."
 
@@ -124,8 +126,8 @@ jobs:
           APKSIGNER="$BUILD_TOOLS_PATH/apksigner"
 
           # 对齐 (zipalign) - 这一步对 Android 性能和稳定性很重要
-          $ZIPALIGN -f -v 4 imagetotext_x86_Native.apk imagetotext_x86_Native-aligned.apk
-          $ZIPALIGN -f -v 4 imagetotext_Native.apk imagetotext_Native-aligned.apk          
+          $ZIPALIGN -f -v 4 imagetotext_x64_raw.apk imagetotext_x64.apk
+          $ZIPALIGN -f -v 4 imagetotext_arm64_raw.apk imagetotext_arm64.apk          
 
           echo "Using build-tools from: $BUILD_TOOLS_PATH"
 
@@ -134,15 +136,15 @@ jobs:
             --ks-pass pass:"$K_PASS" \
             --ks-key-alias "imagetotext-alias" \
             --key-pass pass:"$K_PASS" \
-            --out imagetotext_x86_Native-final.apk \
-            imagetotext_x86_Native-aligned.apk
+            --out imagetotext_x64-final.apk \
+            imagetotext_x64.apk
 
           $APKSIGNER sign --ks release.keystore \
             --ks-pass pass:"$K_PASS" \
             --ks-key-alias "imagetotext-alias" \
             --key-pass pass:"$K_PASS" \
-            --out imagetotext_Native-final.apk \
-            imagetotext_Native-aligned.apk
+            --out imagetotext_arm64-final.apk \
+            imagetotext_arm64.apk
 
           echo "Success! Native artifacts renamed."
 
@@ -151,8 +153,8 @@ jobs:
         with:
           name: android-apk
           path: |
-            imagetotext_arm64.apk
-            imagetotext_x64.apk
+            imagetotext_arm64-final.apk
+            imagetotext_x64-final.apk
           compression-level: 0
 
   create-release:
