@@ -10,3 +10,4 @@ ch_PP-OCRv5_rec_server_infer.onnx
 ch_PP-OCRv5_server_det.onnx
 onnx_extracted/
 debug_lines/
+识别结果*.txt
