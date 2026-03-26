@@ -35,9 +35,9 @@ jobs:
 
       - name: Build Android (Native Mode)
         env:
-          K_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          K_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
-          K_ALIAS: "imagetotext-alias"
+          K_BASE64: ${{ secrets.K_BASE64 }}
+          K_PASS: ${{ secrets.K_PASS }}
+          K_ALIAS: ${{ secrets.K_ALIAS }}
         run: |
           RAW_VERSION=${GITHUB_REF#refs/tags/}
           # 2. 下载并安装 bundletool (解决报错核心)
